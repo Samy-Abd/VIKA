@@ -1,0 +1,12 @@
+watchdog==4.0.0
+pypdf==4.2.0
+pywin32==306; platform_system=="Windows"
+gradio
+sentence-transformers
+faiss-cpu
+langchain>=0.2
+llama-cpp-python
+pymupdf
+paddleocr
+pdf2image
+tqdm
