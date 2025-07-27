@@ -1,40 +1,61 @@
 #!/usr/bin/env python
-# generate.py – Step 8: run the LLM locally and emit an answer
+# generate.py – Step 8: run the LLM locally and emit an answer (with fallback model download)
 
-import pathlib, sys, textwrap
+import pathlib, sys, os
 from llama_cpp import Llama
-import os
+
+# Optional: install huggingface_hub if not present
+try:
+    from huggingface_hub import hf_hub_download
+except ImportError:
+    raise SystemExit("❌ huggingface_hub not installed. Install with:\n  pip install huggingface_hub")
 
 ROOT = pathlib.Path(__file__).parent
-MODEL = ROOT / "models" / "mistral-7b-instruct-v0.2.Q5_K_M.gguf"
+MODEL_DIR = ROOT / "models"
+MODEL_NAME = "mistral-7b-instruct-v0.2.Q5_K_M.gguf"
+MODEL_PATH = MODEL_DIR / MODEL_NAME
+
 PROMPT_PATH = ROOT / "prompt.txt"
 OUT_PATH = ROOT / "answer.txt"
 
+# Fallback download if model is missing
+if not MODEL_PATH.exists():
+    print("🔽 Model not found locally. Downloading from Hugging Face…")
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    downloaded_path = hf_hub_download(
+        repo_id="TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+        filename=MODEL_NAME,
+        local_dir=str(MODEL_DIR),
+        local_dir_use_symlinks=False  # ensure a real file copy
+    )
+    print(f"✅ Model downloaded → {downloaded_path}")
+    MODEL_PATH = pathlib.Path(downloaded_path)
+
 PROMPT = PROMPT_PATH.read_text(encoding="utf-8")
 
-# 1. Spin up the model (7-B params in 4-bit ≈ 6.2 GB)
+# 1. Spin up the model (7B in 4-bit = ~6GB)
 llm = Llama(
-    model_path=str(MODEL),
-    n_ctx=4096,            # Mistral can use long contexts
-    n_threads=max(1, os.cpu_count() - 2),  # leave one core free
-    n_gpu_layers=-1        # keep everything on CPU
+    model_path=str(MODEL_PATH),
+    n_ctx=4096,
+    n_threads=max(1, os.cpu_count() - 1),
+    n_gpu_layers=32  
 )
 
-# 2. Run the inference 💡
+# 2. Run inference
 print("▶ Generating …")
 tokens = llm.create_completion(
     PROMPT,
     temperature=0.7,
     top_p=0.95,
     max_tokens=800,
-    stop=["Source:", "Answer:"],  # mirrors the prompt format
-    stream=True,                 # yields chunks immediately
+    stop=["Source:", "Answer:"],
+    stream=True,
 )
 
 with OUT_PATH.open("w", encoding="utf-8") as out_f:
     for chunk in tokens:
         txt = chunk["choices"][0]["text"]
-        sys.stdout.write(txt)    # live console stream
+        sys.stdout.write(txt)
         out_f.write(txt)
 
 print(f"\n✅  answer.txt written → {OUT_PATH}")

@@ -45,23 +45,17 @@ INDEX_DIR.mkdir(parents=True, exist_ok=True)
 # Utility – build sidebar markdown (original filenames)
 ###############################################################################
 
-def _load_manifest_mapping() -> Dict[str, str]:
-    """Return mapping *hash ➜ original_filename* from MANIFEST.  Gracefully
-    handles missing file / malformed rows by returning an empty dict."""
-    mapping: Dict[str, str] = {}
+def _load_manifest_mapping() -> dict[str, str]:
+    """Return {hash: original_filename}.  Ignores rows that miss either."""
+    mapping: dict[str, str] = {}
     if not MANIFEST.exists():
         return mapping
-    try:
-        with MANIFEST.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                h = row.get("hash") or row.get("sha256") or row.get("id")
-                name = row.get("original") or row.get("name") or row.get("filename")
-                if h and name:
-                    mapping[h] = name
-    except Exception:
-        # If manifest malformed, fall back silently
-        pass
+    with MANIFEST.open("r", encoding="utf-8", newline="") as fp:
+        for row in csv.DictReader(fp):
+            h = (row.get("hash") or row.get("sha256") or "").strip()
+            name = (row.get("original") or row.get("filename") or "").strip()
+            if h and name:
+                mapping[h] = name
     return mapping
 
 
@@ -71,12 +65,12 @@ def list_documents_md() -> str:
         return "*(no documents indexed yet)*"
 
     mapping = _load_manifest_mapping()
-    items = []
-    for p in pdfs:
-        doc_hash = p.stem
-        display = mapping.get(doc_hash, doc_hash)
-        items.append(f"- **{display}**")
+    items = [
+        f"- **{mapping.get(p.stem, '(unknown‑name)')}**"
+        for p in pdfs
+    ]
     return "### 🗂️ Indexed documents\n" + "\n".join(items)
+
 
 ###############################################################################
 # Wrapper around embed_faiss for incremental adds
@@ -203,8 +197,8 @@ def token_stream(query: str, history: Sequence[Tuple[str, str]]):
     if not passages:
         reranked = []
     else:
-        reranked = get_reranker().rerank(query, passages)[:10]
-        
+        reranked = get_reranker().rerank(query, passages)[:5]
+
     prompt = build_prompt(query, reranked, history=history)
 
     llm = get_llm()

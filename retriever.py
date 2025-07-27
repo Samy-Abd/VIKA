@@ -64,9 +64,24 @@ def embed_queries(model: SentenceTransformer, queries: List[str]) -> np.ndarray:
     return emb.astype("float32")
 
 
-def search(index: faiss.Index, metadata: List[Dict], query_vec: np.ndarray, top_k: int):
+def search(index: faiss.Index,
+           metadata: List[Dict],
+           query_vec: np.ndarray,
+           top_k: int):
+    # 1) Rien à chercher si l’index est vide
+    if index.ntotal == 0 or not metadata:
+        return []
+
     scores, idxs = index.search(query_vec, top_k)
-    return [(float(s), metadata[i]) for s, i in zip(scores[0], idxs[0])]
+
+    results = []
+    for s, i in zip(scores[0], idxs[0]):
+        # FAISS renvoie -1 quand il n’y a pas de voisin
+        if i < 0 or i >= len(metadata):
+            continue
+        results.append((float(s), metadata[i]))
+    return results
+
 
 
 def load_chunk_text(chunks_dir: Path, doc_id: str, chunk_id: int) -> str | None:
