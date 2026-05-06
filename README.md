@@ -1,7 +1,7 @@
 # VIKA - Evaluated RAG Assistant for Scientific Documents
 
 ## Live Demo
-[![Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces-yellow)](https://huggingface.co/spaces/your-username/vika)
+[![Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces-yellow)]([https://huggingface.co/spaces/your-username/vika](https://huggingface.co/spaces/Samy-Abd/VIKA))
 
 ## What is VIKA?
 VIKA is a retrieval-augmented assistant for students, researchers, and teachers who need grounded answers from uploaded scientific PDFs. Users upload their own documents at runtime, VIKA indexes them in-session, retrieves relevant page-aware context, and streams cited answers through a Gradio interface.
