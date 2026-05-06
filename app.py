@@ -24,6 +24,7 @@ import retriever
 from document_intake import PDFHandler
 from parser_utils import detect_language
 from prompt_builder import build_prompt
+from prompt_builder import citation_label_for_doc
 from reranker import CrossEncoderReranker
 
 
@@ -36,6 +37,7 @@ REPORT_PATH = Path(tempfile.gettempdir()) / "vika_session_evaluation.json"
 DEFAULT_RETRIEVAL_MODE = "hybrid"
 TOP_CANDIDATES = 20
 TOP_CONTEXT_CHUNKS = 5
+RELEVANCE_SCORE_THRESHOLD = 0.0
 
 PDF_STORE.mkdir(parents=True, exist_ok=True)
 INDEX_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,6 +61,18 @@ footer { display: none !important; }
     padding: 8px 0;
     border-bottom: 1px solid var(--color-border-tertiary);
     margin-bottom: 8px;
+}
+.selector-help {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    color: var(--color-text-secondary);
+    font-size: 12px;
+    margin: -2px 0 8px;
+}
+.selector-help span {
+    border-bottom: 1px dotted var(--color-text-tertiary);
+    cursor: help;
 }
 #chatbot {
     border: 0.5px solid var(--color-border-tertiary) !important;
@@ -215,13 +229,14 @@ def _build_ctx_html(reranked: list[dict[str, Any]], total_hits: int) -> str:
     for item in reranked:
         doc_id = str(item.get("doc_id", "unknown"))
         page = item.get("page") if item.get("page") is not None else "?"
+        source_label = citation_label_for_doc(doc_id)
         score = float(item.get("rerank_score", item.get("score", 0.0)))
         pct = _score_percent(score)
         color = "#1d8f6f" if pct >= 70 else "#b7791f" if pct >= 40 else "#c2413b"
         snippet = html.escape((item.get("text") or "")[:160])
         page_type = html.escape(str(item.get("page_type") or "text"))
         sources = ", ".join(item.get("retrieval_sources") or [])
-        citation = html.escape(f"[{doc_id} p.{page}]")
+        citation = html.escape(f"[{source_label} p.{page}]")
 
         chunks_html += f"""
         <div class='chunk-card'>
@@ -252,7 +267,8 @@ def _format_sources(reranked: list[dict[str, Any]]) -> str:
         if key in seen:
             continue
         seen.add(key)
-        pills += f"<span class='source-pill'>[{html.escape(doc_id)} p.{html.escape(str(page))}]</span>"
+        source_label = citation_label_for_doc(doc_id)
+        pills += f"<span class='source-pill'>[{html.escape(source_label)} p.{html.escape(str(page))}]</span>"
     return f"<div style='margin-top:8px'>{pills}</div>"
 
 
@@ -377,6 +393,8 @@ def retrieve_and_rerank(query: str, retrieval_mode: str) -> tuple[retriever.Retr
 EVAL_COLUMNS = [
     "Q#",
     "Query",
+    "LLM model",
+    "LLM routing",
     "Retrieval (ms)",
     "Generation (ms)",
     "Total (ms)",
@@ -386,7 +404,10 @@ EVAL_COLUMNS = [
     "Reranker min",
     "Cosine sim",
     "BM25 %",
-    "Mode",
+    "Hit@5",
+    "Recall@5",
+    "MRR",
+    "Retrieval mode",
 ]
 
 
@@ -408,6 +429,8 @@ def _eval_table_rows() -> list[list[Any]]:
         [
             record["query_index"],
             record["query"],
+            record["llm_model"],
+            record["llm_routing_mode"],
             round(record["retrieval_latency_ms"], 2),
             round(record["generation_latency_ms"], 2),
             round(record["total_latency_ms"], 2),
@@ -417,36 +440,69 @@ def _eval_table_rows() -> list[list[Any]]:
             round(record["reranker_score_min"], 4),
             round(record["cosine_sim_mean"], 4),
             round(record["bm25_contribution_pct"], 2),
+            round(record["hit_at_5"], 4),
+            round(record["recall_at_5"], 4),
+            round(record["mrr"], 4),
             record["retrieval_mode"],
         ]
         for record in records
     ]
 
 
-def _eval_summary_values() -> tuple[int, float, float, float]:
+def _eval_summary_values() -> tuple[int, float, float, float, float, float]:
     with _eval_lock:
         records = list(_eval_records)
     if not records:
-        return 0, 0.0, 0.0, 0.0
+        return 0, 0.0, 0.0, 0.0, 0.0, 0.0
+    total_latencies = [record["total_latency_ms"] for record in records]
     return (
         len(records),
-        round(float(np.mean([record["total_latency_ms"] for record in records])), 2),
+        round(float(np.mean(total_latencies)), 2),
+        round(float(np.percentile(total_latencies, 50)), 2),
+        round(float(np.percentile(total_latencies, 95)), 2),
         round(float(np.mean([record["reranker_score_mean"] for record in records])), 4),
         round(float(np.mean([record["cosine_sim_mean"] for record in records])), 4),
     )
 
 
 def _eval_outputs():
-    total, mean_latency, mean_rerank, mean_cosine = _eval_summary_values()
+    total, mean_latency, p50_latency, p95_latency, mean_rerank, mean_cosine = _eval_summary_values()
     report = _write_report()
     return (
         total,
         mean_latency,
+        p50_latency,
+        p95_latency,
         mean_rerank,
         mean_cosine,
         _eval_table_rows(),
         gr.update(value=report),
     )
+
+
+def _retrieval_quality_metrics(retrieval_result: retriever.RetrievalResult) -> tuple[float, float, float]:
+    ranked = retrieval_result.reranked_candidates or retrieval_result.reranked
+    if not ranked:
+        return 0.0, 0.0, 0.0
+
+    relevant_indexes = [
+        index
+        for index, item in enumerate(ranked)
+        if float(item.get("rerank_score", item.get("score", 0.0))) >= RELEVANCE_SCORE_THRESHOLD
+    ]
+    if not relevant_indexes:
+        return 0.0, 0.0, 0.0
+
+    top_indexes = set(range(min(5, len(ranked))))
+    relevant_top = [index for index in relevant_indexes if index in top_indexes]
+    hit_at_5 = 1.0 if relevant_top else 0.0
+    recall_at_5 = len(relevant_top) / len(relevant_indexes)
+    mrr = 0.0
+    for index in relevant_indexes:
+        if index < 5:
+            mrr = 1.0 / (index + 1)
+            break
+    return hit_at_5, recall_at_5, mrr
 
 
 def _record_evaluation(
@@ -455,6 +511,8 @@ def _record_evaluation(
     retrieval_latency_ms: float,
     generation_latency_ms: float,
     total_latency_ms: float,
+    llm_model: str,
+    llm_routing_mode: str,
 ) -> None:
     used = retrieval_result.reranked
     reranker_scores = [float(item.get("rerank_score", item.get("score", 0.0))) for item in used]
@@ -462,11 +520,14 @@ def _record_evaluation(
     cosine_mean = retriever.mean_cosine_similarity(index, retrieval_result.query_vector, used)
     bm25_count = sum(1 for item in used if "bm25" in (item.get("retrieval_sources") or []))
     page_types = Counter(str(item.get("page_type") or "text") for item in used)
+    hit_at_5, recall_at_5, mrr = _retrieval_quality_metrics(retrieval_result)
 
     with _eval_lock:
         record = {
             "query_index": len(_eval_records) + 1,
             "query": _truncate_query(query),
+            "llm_model": llm_model,
+            "llm_routing_mode": llm_routing_mode,
             "retrieval_latency_ms": float(retrieval_latency_ms),
             "generation_latency_ms": float(generation_latency_ms),
             "total_latency_ms": float(total_latency_ms),
@@ -476,6 +537,9 @@ def _record_evaluation(
             "reranker_score_min": float(np.min(reranker_scores)) if reranker_scores else 0.0,
             "cosine_sim_mean": float(cosine_mean),
             "bm25_contribution_pct": float((bm25_count / len(used)) * 100) if used else 0.0,
+            "hit_at_5": float(hit_at_5),
+            "recall_at_5": float(recall_at_5),
+            "mrr": float(mrr),
             "page_types_used": dict(page_types),
             "retrieval_mode": retrieval_result.retrieval_mode,
         }
@@ -486,6 +550,8 @@ def chat_stream(
     user_message: str,
     chat_history: list[list[str]],
     model_name: str,
+    llm_routing_mode: str,
+    routellm_router_name: str,
     retrieval_mode: str,
     ctx_html: str,
 ):
@@ -502,11 +568,29 @@ def chat_stream(
     chat_history = chat_history or []
     chat_history.append([user_message, ""])
     prompt = build_prompt(user_message, reranked, history=chat_history[:-1])
+    route_decision = llm_router.select_model_for_prompt(
+        user_message,
+        manual_model_name=model_name,
+        routing_mode=llm_routing_mode,
+        router_name=routellm_router_name,
+    )
+    active_model = {"name": route_decision.model_name}
+
+    def on_model_start(model_used: str) -> None:
+        active_model["name"] = model_used
 
     answer = ""
     generation_start = time.time()
     try:
-        for token in llm_router.stream_response(prompt, model_name):
+        for token in llm_router.stream_response(
+            prompt,
+            model_name,
+            routing_mode=llm_routing_mode,
+            router_name=routellm_router_name,
+            route_text=user_message,
+            route_decision=route_decision,
+            on_model_start=on_model_start,
+        ):
             answer += token
             chat_history[-1][1] = answer
             yield chat_history, "", ctx_html, *eval_state
@@ -517,6 +601,8 @@ def chat_stream(
 
     generation_latency_ms = (time.time() - generation_start) * 1000
     total_latency_ms = (time.time() - total_start) * 1000
+    answer += f"\n\n_Model used: **{active_model['name']}**._"
+    chat_history[-1][1] = answer
     if reranked:
         chat_history[-1][1] = answer + _format_sources(reranked)
     _record_evaluation(
@@ -525,6 +611,8 @@ def chat_stream(
         retrieval_latency_ms,
         generation_latency_ms,
         total_latency_ms,
+        active_model["name"],
+        llm_routing_mode,
     )
     yield chat_history, "", ctx_html, *_eval_outputs()
 
@@ -559,8 +647,24 @@ with gr.Blocks(
                         model_dd = gr.Dropdown(
                             choices=llm_router.MODEL_NAMES,
                             value=llm_router.DEFAULT_MODEL,
-                            label="Model",
+                            label="Manual model",
                             scale=2,
+                            container=False,
+                        )
+                        llm_routing_mode_dd = gr.Dropdown(
+                            choices=list(llm_router.ROUTING_MODES),
+                            value=llm_router.DEFAULT_ROUTING_MODE,
+                            label="LLM routing",
+                            scale=1,
+                            container=False,
+                        )
+                        routellm_router_dd = gr.Dropdown(
+                            choices=list(llm_router.ROUTELLM_ROUTERS),
+                            value=llm_router.DEFAULT_ROUTELLM_ROUTER
+                            if llm_router.DEFAULT_ROUTELLM_ROUTER in llm_router.ROUTELLM_ROUTERS
+                            else "bert",
+                            label="RouteLLM router",
+                            scale=1,
                             container=False,
                         )
                         retrieval_mode_dd = gr.Dropdown(
@@ -570,6 +674,17 @@ with gr.Blocks(
                             scale=1,
                             container=False,
                         )
+
+                    gr.HTML(
+                        """
+                        <div class="selector-help">
+                            <span title="The exact LLM to call when routing is Manual. Automatic mode may override this choice.">Manual model</span>
+                            <span title="Automatic evaluates prompt complexity and routes to a suitable available model. Manual sends the request to your selected model.">LLM routing</span>
+                            <span title="RouteLLM router used to score prompt complexity on CPU: bert, sw_ranking, mf, or the local heuristic fallback.">Prompt complexity evaluator</span>
+                            <span title="Retrieval controls how document chunks are found before reranking: dense, BM25, or hybrid.">Retrieval mode</span>
+                        </div>
+                        """
+                    )
 
                     chatbot = gr.Chatbot(
                         height=500,
@@ -606,6 +721,19 @@ with gr.Blocks(
                     precision=2,
                     interactive=False,
                 )
+                p50_latency_box = gr.Number(
+                    label="p50 latency (ms)",
+                    value=0.0,
+                    precision=2,
+                    interactive=False,
+                )
+                p95_latency_box = gr.Number(
+                    label="p95 latency (ms)",
+                    value=0.0,
+                    precision=2,
+                    interactive=False,
+                )
+            with gr.Row():
                 mean_rerank_box = gr.Number(
                     label="Mean reranker score",
                     value=0.0,
@@ -619,6 +747,18 @@ with gr.Blocks(
                     interactive=False,
                 )
 
+            gr.Markdown(
+                """
+**Metric notes**
+- **Hit@5**: 1 when at least one CrossEncoder-relevant chunk appears in the top 5, else 0.
+- **Recall@5**: share of CrossEncoder-relevant retrieved candidates that appear in the top 5.
+- **MRR**: reciprocal rank of the first CrossEncoder-relevant chunk in the top 5.
+- **p50 / p95 latency**: median and 95th percentile end-to-end latency for this session.
+- **Reranker / cosine / BM25 %**: relevance score, dense embedding similarity, and share of used chunks sourced by BM25.
+CrossEncoder-relevant means reranker score >= 0 because no human relevance labels are available in-session.
+"""
+            )
+
             eval_table = gr.Dataframe(
                 headers=EVAL_COLUMNS,
                 value=[],
@@ -630,13 +770,23 @@ with gr.Blocks(
                 value=str(REPORT_PATH),
             )
 
-    submit_inputs = [txt, chatbot, model_dd, retrieval_mode_dd, ctx_panel]
+    submit_inputs = [
+        txt,
+        chatbot,
+        model_dd,
+        llm_routing_mode_dd,
+        routellm_router_dd,
+        retrieval_mode_dd,
+        ctx_panel,
+    ]
     submit_outputs = [
         chatbot,
         txt,
         ctx_panel,
         total_queries_box,
         mean_latency_box,
+        p50_latency_box,
+        p95_latency_box,
         mean_rerank_box,
         mean_cosine_box,
         eval_table,

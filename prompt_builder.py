@@ -1,7 +1,10 @@
 """Prompt construction for page-cited RAG answers."""
 from __future__ import annotations
 
+import csv
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 try:
@@ -10,12 +13,50 @@ except ImportError:  # pragma: no cover - dependency is declared
     Template = None
 
 
+ROOT = Path(__file__).parent
+MANIFEST = ROOT / "data" / "manifest.csv"
+MAX_CITATION_LABEL_LEN = 48
+_manifest_lock = threading.Lock()
+
+
+def _load_manifest_mapping() -> dict[str, str]:
+    if not MANIFEST.exists():
+        return {}
+
+    mapping: dict[str, str] = {}
+    with _manifest_lock:
+        with MANIFEST.open("r", encoding="utf-8", newline="") as file:
+            for row in csv.DictReader(file):
+                doc_hash = (row.get("hash") or "").strip()
+                original = (row.get("original") or "").strip()
+                if doc_hash and original:
+                    mapping[doc_hash] = original
+    return mapping
+
+
+def truncate_citation_label(label: str, max_len: int = MAX_CITATION_LABEL_LEN) -> str:
+    label = " ".join((label or "unknown").replace("[", "(").replace("]", ")").split())
+    if len(label) <= max_len:
+        return label
+
+    suffix = Path(label).suffix
+    if suffix and len(suffix) + 8 < max_len:
+        keep = max_len - len(suffix) - 3
+        return f"{label[:keep]}...{suffix}"
+    return f"{label[: max_len - 3]}..."
+
+
+def citation_label_for_doc(doc_id: str) -> str:
+    original = _load_manifest_mapping().get(doc_id, doc_id)
+    return truncate_citation_label(original)
+
+
 SYSTEM_PROMPT = """\
 You are VIKA, a scientific-document assistant.
 
 Grounding rules:
 - Use only the retrieved context passages to answer.
-- Cite every factual claim that comes from context with [doc_id p.PAGE].
+- Cite every factual claim that comes from context with [source filename p.PAGE].
 - If the answer is not supported by the retrieved context, say: "I cannot answer from the uploaded documents."
 - Do not invent sources, page numbers, or document details.
 
@@ -38,7 +79,7 @@ Assistant: {{ turn[1] }}
 {% if chunks %}
 Retrieved context:
 {% for c in chunks %}
-Source: [{{ c.doc_id }} p.{{ c.page }}]
+Source: [{{ c.source_label }} p.{{ c.page }}]
 Page type: {{ c.page_type }}
 {{ c.text }}
 ---
@@ -58,15 +99,18 @@ class Chunk:
     doc_id: str
     page: int | str
     page_type: str = "text"
+    source_label: str = "unknown"
 
     @classmethod
     def from_mapping(cls, obj: dict) -> "Chunk":
         page = obj.get("page")
+        doc_id = str(obj.get("doc_id") or obj.get("source") or "unknown")
         return cls(
             text=obj.get("text", ""),
-            doc_id=str(obj.get("doc_id") or obj.get("source") or "unknown"),
+            doc_id=doc_id,
             page=page if page is not None else "?",
             page_type=obj.get("page_type") or "text",
+            source_label=citation_label_for_doc(doc_id),
         )
 
 
@@ -97,7 +141,7 @@ def _render_template(
     if chunks:
         lines.append("Retrieved context:")
         for chunk in chunks:
-            lines.append(f"Source: [{chunk.doc_id} p.{chunk.page}]")
+            lines.append(f"Source: [{chunk.source_label} p.{chunk.page}]")
             lines.append(f"Page type: {chunk.page_type}")
             lines.append(chunk.text.rstrip())
             lines.append("---")

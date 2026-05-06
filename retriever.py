@@ -48,6 +48,7 @@ class RetrievalResult:
     reranked: list[dict[str, Any]]
     query_vector: np.ndarray
     retrieval_mode: str
+    reranked_candidates: list[dict[str, Any]]
 
 
 class SimpleBM25:
@@ -286,15 +287,19 @@ def retrieve(
 
     candidates = candidates[:candidate_k]
     if reranker is not None and candidates:
-        reranked = reranker.rerank(query, [dict(item) for item in candidates])
+        reranked_candidates = reranker.rerank(query, [dict(item) for item in candidates])
     else:
-        reranked = [dict(item, rerank_score=float(item.get("score", 0.0))) for item in candidates]
+        reranked_candidates = [
+            dict(item, rerank_score=float(item.get("score", 0.0)))
+            for item in candidates
+        ]
 
     return RetrievalResult(
         candidates=candidates,
-        reranked=reranked[:final_k],
+        reranked=reranked_candidates[:final_k],
         query_vector=query_vector,
         retrieval_mode=retrieval_mode,
+        reranked_candidates=reranked_candidates,
     )
 
 
