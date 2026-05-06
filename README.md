@@ -1,16 +1,3 @@
----
-title: VIKA
-emoji: 📚
-colorFrom: green
-colorTo: blue
-sdk: gradio
-sdk_version: 5.38.2
-app_file: app.py
-pinned: false
-license: mit
-short_description: Evaluated RAG assistant for uploaded scientific PDFs
----
-
 # VIKA - Evaluated RAG Assistant for Scientific Documents
 
 ## Live Demo
