@@ -1,7 +1,7 @@
 # VIKA - Evaluated RAG Assistant for Scientific Documents
 
 ## Live Demo
-[![Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces-yellow)](https://huggingface.co/spaces/your-username/vika)
+[![Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces-yellow)]([https://huggingface.co/spaces/your-username/vika](https://huggingface.co/spaces/Samy-Abd/VIKA))
 
 ---
 
