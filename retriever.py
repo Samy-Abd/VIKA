@@ -1,169 +1,355 @@
-#!/usr/bin/env python
-"""
-retriever.py – Lightweight semantic search over a FAISS index (now with *optional* empty‑index handling).
-------------------------------------------------------------------------------------------------------
-This rewrite keeps 100 % CLI compatibility **but** returns Python exceptions (instead of
-`SystemExit`) from library helpers so GUI apps can import the module safely when an index
-is not yet built.
-
-Key changes
-~~~~~~~~~~~
-* `load_faiss_index(allow_empty: bool = False)` – if `allow_empty=True` and the
-  index is missing, an *empty* `IndexFlatIP` plus empty `metadata` list is
-  returned rather than aborting.
-* Extracted `print_result()` to DRY the CLI pretty‑print.
-* Added type annotations + docstrings cleanup.
-"""
+"""Dense, BM25, and hybrid retrieval for VIKA."""
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import Any
 
-import faiss  # type: ignore
+import faiss
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
 
-MODEL_NAME = "all-MiniLM-L6-v2"  # Must match embed_faiss.py
-EMBED_DIM = 384  # Dimension of all‑MiniLM‑L6‑v2
+try:
+    import torch
+except ImportError:  # pragma: no cover - declared in requirements
+    torch = None
 
-###############################################################################
-# Helpers
-###############################################################################
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover - declared in requirements
+    SentenceTransformer = None
 
-def load_faiss_index(index_dir: Path, allow_empty: bool = False):
-    """Return `(index, metadata)`.
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:  # pragma: no cover - requirements install rank_bm25
+    BM25Okapi = None
 
-    If *allow_empty* is **True** the function yields an *empty* IndexFlatIP & list
-    when the files don’t exist, letting calling code continue gracefully.
-    """
+
+MODEL_NAME = "all-MiniLM-L6-v2"
+EMBED_DIM = 384
+RRF_K = 60
+RETRIEVAL_MODES = ("dense", "bm25", "hybrid")
+
+
+@dataclass
+class BM25Bundle:
+    records: list[dict[str, Any]]
+    tokenized_corpus: list[list[str]]
+    model: Any
+
+
+@dataclass
+class RetrievalResult:
+    candidates: list[dict[str, Any]]
+    reranked: list[dict[str, Any]]
+    query_vector: np.ndarray
+    retrieval_mode: str
+
+
+class SimpleBM25:
+    """Small fallback used only when rank_bm25 is unavailable locally."""
+
+    def __init__(self, corpus: list[list[str]]):
+        self.corpus = corpus
+        self.doc_count = max(len(corpus), 1)
+        self.avgdl = sum(len(doc) for doc in corpus) / self.doc_count
+        self.df: dict[str, int] = {}
+        for doc in corpus:
+            for token in set(doc):
+                self.df[token] = self.df.get(token, 0) + 1
+
+    def get_scores(self, query_tokens: list[str]) -> np.ndarray:
+        scores = []
+        k1 = 1.5
+        b = 0.75
+        for doc in self.corpus:
+            freqs: dict[str, int] = {}
+            for token in doc:
+                freqs[token] = freqs.get(token, 0) + 1
+            score = 0.0
+            doc_len = max(len(doc), 1)
+            for token in query_tokens:
+                if token not in freqs:
+                    continue
+                df = self.df.get(token, 0)
+                idf = math.log(1 + (self.doc_count - df + 0.5) / (df + 0.5))
+                tf = freqs[token]
+                denom = tf + k1 * (1 - b + b * doc_len / max(self.avgdl, 1e-9))
+                score += idf * (tf * (k1 + 1)) / denom
+            scores.append(score)
+        return np.asarray(scores, dtype="float32")
+
+
+def tokenize(text: str) -> list[str]:
+    return re.findall(r"[\w\-]+", (text or "").lower(), flags=re.UNICODE)
+
+
+def load_faiss_index(index_dir: Path, allow_empty: bool = False) -> tuple[faiss.Index, list[dict[str, Any]]]:
     index_path = index_dir / "faiss.index"
     meta_path = index_dir / "metadata.jsonl"
 
     if not index_path.exists() or not meta_path.exists():
         if allow_empty:
             return faiss.IndexFlatIP(EMBED_DIM), []
-        raise FileNotFoundError(f"No index found under {index_dir}")
+        raise FileNotFoundError(f"No FAISS index found under {index_dir}")
 
     index = faiss.read_index(str(index_path))
-
-    metadata: List[Dict] = [json.loads(line) for line in meta_path.read_text(encoding="utf-8").splitlines() if line]
+    metadata = [
+        json.loads(line)
+        for line in meta_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
     if index.ntotal != len(metadata):
         raise ValueError("Vector count mismatch between FAISS index and metadata.jsonl")
-
     return index, metadata
 
 
-def embed_queries(model: SentenceTransformer, queries: List[str]) -> np.ndarray:
-    emb = model.encode(queries, normalize_embeddings=True, show_progress_bar=False)
-    return emb.astype("float32")
+def embed_queries(model: Any, queries: list[str]) -> np.ndarray:
+    embeddings = model.encode(queries, normalize_embeddings=True, show_progress_bar=False)
+    return np.asarray(embeddings, dtype="float32")
 
 
-def search(index: faiss.Index,
-           metadata: List[Dict],
-           query_vec: np.ndarray,
-           top_k: int):
-    # 1) Rien à chercher si l’index est vide
-    if index.ntotal == 0 or not metadata:
-        return []
-
-    scores, idxs = index.search(query_vec, top_k)
-
-    results = []
-    for s, i in zip(scores[0], idxs[0]):
-        # FAISS renvoie -1 quand il n’y a pas de voisin
-        if i < 0 or i >= len(metadata):
-            continue
-        results.append((float(s), metadata[i]))
-    return results
-
-
-
-def load_chunk_text(chunks_dir: Path, doc_id: str, chunk_id: int) -> str | None:
+def load_chunk_record(chunks_dir: Path, doc_id: str, chunk_id: int) -> dict[str, Any] | None:
     jsonl_path = chunks_dir / f"{doc_id}.chunks.jsonl"
     if not jsonl_path.exists():
         return None
-    for line in jsonl_path.read_text(encoding="utf-8").splitlines():
-        obj = json.loads(line)
-        if obj.get("id") == chunk_id:
-            return obj.get("text")
+    with jsonl_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("id") == chunk_id or record.get("chunk_id") == chunk_id:
+                return record
     return None
 
-###############################################################################
-# CLI helpers
-###############################################################################
+
+def load_chunk_text(chunks_dir: Path, doc_id: str, chunk_id: int) -> str | None:
+    record = load_chunk_record(chunks_dir, doc_id, chunk_id)
+    return record.get("text") if record else None
+
+
+def _record_with_text(record: dict[str, Any], chunks_dir: Path, index_position: int) -> dict[str, Any] | None:
+    item = dict(record)
+    item["index_position"] = index_position
+    if "chunk_id" not in item:
+        item["chunk_id"] = item.get("id")
+    if not item.get("text"):
+        chunk = load_chunk_record(chunks_dir, item["doc_id"], int(item["chunk_id"]))
+        if chunk:
+            item.update({key: value for key, value in chunk.items() if key not in {"id"}})
+            item["text"] = chunk.get("text", "")
+    if not item.get("text"):
+        return None
+    if item.get("page") is None:
+        item["page"] = 1
+    item["page_type"] = item.get("page_type") or "text"
+    item["lang"] = item.get("lang") or "en"
+    return item
+
+
+def build_bm25_index(metadata: list[dict[str, Any]], chunks_dir: Path) -> BM25Bundle:
+    records: list[dict[str, Any]] = []
+    corpus: list[list[str]] = []
+
+    for position, record in enumerate(metadata):
+        item = _record_with_text(record, chunks_dir, position)
+        if item is None:
+            continue
+        records.append(item)
+        corpus.append(tokenize(item["text"]))
+
+    if not corpus:
+        model = SimpleBM25([])
+    else:
+        model = BM25Okapi(corpus) if BM25Okapi is not None else SimpleBM25(corpus)
+    return BM25Bundle(records=records, tokenized_corpus=corpus, model=model)
+
+
+def search_dense(
+    index: faiss.Index,
+    metadata: list[dict[str, Any]],
+    chunks_dir: Path,
+    query_vector: np.ndarray,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    if index.ntotal == 0 or not metadata:
+        return []
+    k = min(top_k, index.ntotal)
+    scores, indexes = index.search(query_vector, k)
+    results: list[dict[str, Any]] = []
+    for rank, (score, position) in enumerate(zip(scores[0], indexes[0]), start=1):
+        if position < 0 or position >= len(metadata):
+            continue
+        item = _record_with_text(metadata[int(position)], chunks_dir, int(position))
+        if item is None:
+            continue
+        item["dense_score"] = float(score)
+        item["dense_rank"] = rank
+        item["retrieval_sources"] = ["dense"]
+        item["score"] = float(score)
+        results.append(item)
+    return results
+
+
+def search_bm25(bundle: BM25Bundle, query: str, top_k: int) -> list[dict[str, Any]]:
+    if not bundle.records:
+        return []
+    scores = np.asarray(bundle.model.get_scores(tokenize(query)), dtype="float32")
+    order = np.argsort(scores)[::-1]
+    results: list[dict[str, Any]] = []
+    for rank, position in enumerate(order[:top_k], start=1):
+        score = float(scores[position])
+        if score <= 0:
+            continue
+        item = dict(bundle.records[int(position)])
+        item["bm25_score"] = score
+        item["bm25_rank"] = rank
+        item["retrieval_sources"] = ["bm25"]
+        item["score"] = score
+        results.append(item)
+    return results
+
+
+def _candidate_key(item: dict[str, Any]) -> tuple[str, int]:
+    return str(item["doc_id"]), int(item.get("chunk_id", item.get("id", 0)))
+
+
+def rrf_fuse(
+    dense_hits: list[dict[str, Any]],
+    bm25_hits: list[dict[str, Any]],
+    rrf_k: int = RRF_K,
+) -> list[dict[str, Any]]:
+    fused: dict[tuple[str, int], dict[str, Any]] = {}
+
+    for rank, item in enumerate(dense_hits, start=1):
+        key = _candidate_key(item)
+        fused[key] = dict(item)
+        fused[key]["retrieval_sources"] = {"dense"}
+        fused[key]["rrf_score"] = 1.0 / (rrf_k + rank)
+        fused[key]["dense_rank"] = rank
+
+    for rank, item in enumerate(bm25_hits, start=1):
+        key = _candidate_key(item)
+        if key not in fused:
+            fused[key] = dict(item)
+            fused[key]["retrieval_sources"] = set()
+            fused[key]["rrf_score"] = 0.0
+        fused[key]["retrieval_sources"].add("bm25")
+        fused[key]["bm25_rank"] = rank
+        fused[key]["bm25_score"] = item.get("bm25_score", 0.0)
+        fused[key]["rrf_score"] += 1.0 / (rrf_k + rank)
+
+    results = []
+    for item in fused.values():
+        item["retrieval_sources"] = sorted(item["retrieval_sources"])
+        item["score"] = float(item["rrf_score"])
+        results.append(item)
+    return sorted(results, key=lambda item: item["score"], reverse=True)
+
+
+def retrieve(
+    query: str,
+    index: faiss.Index,
+    metadata: list[dict[str, Any]],
+    chunks_dir: Path,
+    embed_model: Any,
+    reranker: Any | None = None,
+    retrieval_mode: str = "hybrid",
+    bm25_index: BM25Bundle | None = None,
+    candidate_k: int = 20,
+    final_k: int = 5,
+) -> RetrievalResult:
+    if retrieval_mode not in RETRIEVAL_MODES:
+        raise ValueError(f"retrieval_mode must be one of {RETRIEVAL_MODES}")
+
+    query_vector = embed_queries(embed_model, [query])
+    dense_hits: list[dict[str, Any]] = []
+    bm25_hits: list[dict[str, Any]] = []
+
+    if retrieval_mode in {"dense", "hybrid"}:
+        dense_hits = search_dense(index, metadata, chunks_dir, query_vector, candidate_k)
+    if retrieval_mode in {"bm25", "hybrid"}:
+        bm25_index = bm25_index or build_bm25_index(metadata, chunks_dir)
+        bm25_hits = search_bm25(bm25_index, query, candidate_k)
+
+    if retrieval_mode == "dense":
+        candidates = dense_hits
+    elif retrieval_mode == "bm25":
+        candidates = bm25_hits
+    else:
+        candidates = rrf_fuse(dense_hits, bm25_hits)
+
+    candidates = candidates[:candidate_k]
+    if reranker is not None and candidates:
+        reranked = reranker.rerank(query, [dict(item) for item in candidates])
+    else:
+        reranked = [dict(item, rerank_score=float(item.get("score", 0.0))) for item in candidates]
+
+    return RetrievalResult(
+        candidates=candidates,
+        reranked=reranked[:final_k],
+        query_vector=query_vector,
+        retrieval_mode=retrieval_mode,
+    )
+
+
+def mean_cosine_similarity(
+    index: faiss.Index,
+    query_vector: np.ndarray,
+    items: list[dict[str, Any]],
+) -> float:
+    if not items:
+        return 0.0
+    values: list[float] = []
+    for item in items:
+        position = item.get("index_position")
+        if position is None:
+            continue
+        try:
+            vector = np.asarray(index.reconstruct(int(position)), dtype="float32")
+            values.append(float(np.dot(query_vector[0], vector)))
+        except Exception:
+            continue
+    return float(np.mean(values)) if values else 0.0
+
 
 def _build_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Semantic search over a FAISS index.")
-    p.add_argument("--query", "-q", help="Text of the query (omit in --interactive mode)")
-    p.add_argument("--k", type=int, default=5, help="Number of neighbors to return (default: 5)")
-    p.add_argument("--index_dir", type=Path, default=Path("./data/index"))
-    p.add_argument("--chunks_dir", type=Path, default=Path("./data/pdfs"))
-    p.add_argument("--interactive", action="store_true", help="Run REPL if set (ignores --query)")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description="Search a VIKA FAISS/BM25 index.")
+    parser.add_argument("--query", "-q", help="Text query.")
+    parser.add_argument("--k", type=int, default=5, help="Number of final results.")
+    parser.add_argument("--candidate_k", type=int, default=20, help="Candidate pool size.")
+    parser.add_argument("--mode", choices=RETRIEVAL_MODES, default="hybrid")
+    parser.add_argument("--index_dir", type=Path, default=Path("./data/index"))
+    parser.add_argument("--chunks_dir", type=Path, default=Path("./data/pdfs"))
+    return parser.parse_args()
 
 
-def _pretty_print(results: List[Tuple[float, Dict]], chunks_dir: Path):
-    for rank, (score, meta) in enumerate(results, 1):
-        doc_id = meta["doc_id"]
-        chunk_id = meta["chunk_id"]
-        page = meta.get("page")
-        snippet = load_chunk_text(chunks_dir, doc_id, chunk_id)
-        print("#" * 72)
-        print(f"Rank {rank} – score: {score:.4f}")
-        print(f"Document: {doc_id}   Chunk: {chunk_id}   Page: {page}")
-        if snippet:
-            print("\n" + snippet[:300].replace("\n", " ") + ("…" if len(snippet) > 300 else ""))
-
-###############################################################################
-# Main
-###############################################################################
-
-def main():  # pragma: no cover
+def main() -> None:
     args = _build_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = SentenceTransformer(MODEL_NAME, device=device)
-
-    try:
-        index, metadata = load_faiss_index(args.index_dir, allow_empty=False)
-    except FileNotFoundError as e:
-        sys.exit(str(e))
-
-    if args.interactive:
-        print("▶️  Interactive mode – type a query and hit Enter (Ctrl‑C to exit)")
-        try:
-            while True:
-                q = input("🔍 ")
-                if not q.strip():
-                    continue
-                q_vec = embed_queries(model, [q])
-                hits = search(index, metadata, q_vec, args.k)
-                _pretty_print(hits, args.chunks_dir)
-        except KeyboardInterrupt:
-            print("\nBye! 👋")
-        return
-
     if not args.query:
-        sys.exit("❌ --query is required unless --interactive is used")
+        sys.exit("--query is required")
 
-    q_vec = embed_queries(model, [args.query])
-    hits = search(index, metadata, q_vec, args.k)
-
-    # Write compact JSON to STDOUT (pipeline‑friendly)
-    out = []
-    for score, meta in hits:
-        obj = {"score": score, **meta}
-        snippet = load_chunk_text(args.chunks_dir, meta["doc_id"], meta["chunk_id"])
-        if snippet:
-            obj["text"] = snippet
-        out.append(obj)
-    json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
+    if SentenceTransformer is None:
+        raise SystemExit("sentence-transformers is required for the retriever CLI.")
+    device = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
+    model = SentenceTransformer(MODEL_NAME, device=device)
+    index, metadata = load_faiss_index(args.index_dir, allow_empty=False)
+    result = retrieve(
+        args.query,
+        index,
+        metadata,
+        args.chunks_dir,
+        model,
+        retrieval_mode=args.mode,
+        candidate_k=args.candidate_k,
+        final_k=args.k,
+    )
+    json.dump(result.reranked, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
 
 

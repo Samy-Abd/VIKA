@@ -1,12 +1,25 @@
-watchdog==4.0.0
+--prefer-binary
+--extra-index-url https://pypi.org/simple
+
+torch==2.5.1
+sentence-transformers==5.0.0
+faiss-cpu==1.11.0.post1
+rank_bm25==0.2.2
+
+mistralai>=2,<3
+google-genai
+groq
+
+pymupdf==1.26.3
 pypdf==4.2.0
-pywin32==306; platform_system=="Windows"
-gradio
-sentence-transformers
-faiss-cpu
-langchain>=0.2
-llama-cpp-python
-pymupdf
-paddleocr
-pdf2image
-tqdm
+pytesseract==0.3.13
+Pillow==10.4.0
+langdetect==1.0.9
+
+tqdm==4.67.1
+watchdog==4.0.0
+jinja2
+numpy
+
+gradio==5.38.2
+pytest==8.3.4

@@ -1,30 +1,52 @@
-# ── pipeline.py (only the two run(...) calls change) ────────────────
-import subprocess, sys, json, pathlib
+"""Small CLI helper that retrieves context and writes a prompt preview."""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 from prompt_builder import build_prompt
 
-PY      = sys.executable              # ← absolute path to the venv’s python
-ROOT    = pathlib.Path(__file__).parent
-QUERY   = "Explain to me what a CNN is"
-TOP_K, TOP_N = 20, 10
-TEMPLATE = "my_template.j2"
 
-def run(cmd, stdin_data=None):
-    p = subprocess.run(
-        cmd, cwd=ROOT, input=stdin_data, text=True,
-        capture_output=True
+PYTHON = sys.executable
+ROOT = Path(__file__).parent
+QUERY = "Explain what a CNN is"
+TOP_K = 10
+
+
+def run(command: list[str]) -> str:
+    process = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
     )
-    if p.returncode:
-        print(f"\n❌  {cmd[1]} failed\n---- stderr ----\n{p.stderr}", file=sys.stderr)
-        sys.exit(p.returncode)
-    return p.stdout
+    if process.returncode:
+        print(process.stderr, file=sys.stderr)
+        sys.exit(process.returncode)
+    return process.stdout
 
-print("▶ Retrieving …")
-raw_hits = run([PY, "retriever.py", "--query", QUERY, "--k", str(TOP_K)])
 
-print("▶ Reranking …")
-reranked = run([PY, "reranker.py", "--query", QUERY, "--top", str(TOP_N)], stdin_data=raw_hits)
+def main() -> None:
+    raw_hits = run(
+        [
+            PYTHON,
+            "retriever.py",
+            "--query",
+            QUERY,
+            "--k",
+            str(TOP_K),
+            "--mode",
+            "hybrid",
+        ]
+    )
+    hits = json.loads(raw_hits)
+    prompt = build_prompt(QUERY, hits)
+    (ROOT / "prompt.txt").write_text(prompt, encoding="utf-8")
+    print("prompt.txt written")
 
-hits = json.loads(reranked)
-prompt = build_prompt(QUERY, hits)
-(ROOT / "prompt.txt").write_text(prompt, encoding="utf-8")
-print("✅  prompt.txt written.")
+
+if __name__ == "__main__":
+    main()
